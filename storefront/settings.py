@@ -131,11 +131,15 @@ REST_FRAMEWORK = {
     'PAGE_SIZE': 20,
 }
 
-# Stripe test-mode credentials are supplied via .env; never commit live secrets.
-STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
-STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY', '')
-STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
-STOREFRONT_CURRENCY = os.environ.get('STOREFRONT_CURRENCY', 'usd').lower()
+# Use only sandbox credentials during development. Callback secret follows
+# SasaPay's HMAC-SHA512 guidance (merchant API client ID by default).
+SASAPAY_CLIENT_ID = os.environ.get('SASAPAY_CLIENT_ID', '')
+SASAPAY_CLIENT_SECRET = os.environ.get('SASAPAY_CLIENT_SECRET', '')
+SASAPAY_MERCHANT_CODE = os.environ.get('SASAPAY_MERCHANT_CODE', '')
+SASAPAY_CALLBACK_SECRET = os.environ.get('SASAPAY_CALLBACK_SECRET', SASAPAY_CLIENT_ID)
+SASAPAY_CALLBACK_URL = os.environ.get('SASAPAY_CALLBACK_URL', '')
+SASAPAY_API_BASE = os.environ.get('SASAPAY_API_BASE', 'https://sandbox.sasapay.app')
+STOREFRONT_CURRENCY = 'kes'
 
 
 # Email

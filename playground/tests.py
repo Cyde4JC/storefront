@@ -1,5 +1,8 @@
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+import hashlib
+import hmac
+
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from .models import Product
@@ -13,6 +16,7 @@ class StorefrontTests(TestCase):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Demo mug")
+        self.assertContains(response, "KSh 12.50")
         response = self.client.post(f"/cart/add/{self.product.pk}/")
         self.assertEqual(response.status_code, 302)
         self.assertEqual(self.client.session["cart"][str(self.product.pk)], 1)
@@ -33,8 +37,28 @@ class StorefrontTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertTrue(Product.objects.filter(name="Notebook").exists())
 
-    def test_checkout_without_stripe_key_does_not_create_charge(self):
+    @override_settings(SASAPAY_CLIENT_ID="", SASAPAY_CLIENT_SECRET="", SASAPAY_MERCHANT_CODE="", SASAPAY_CALLBACK_URL="")
+    def test_checkout_without_sasapay_credentials_does_not_start_payment(self):
         self.client.post(f"/cart/add/{self.product.pk}/")
         response = self.client.post("/checkout/", {"email": "buyer@example.com"})
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "not configured yet")
+        self.assertContains(response, "SasaPay sandbox is not configured")
+
+    @override_settings(SASAPAY_CALLBACK_SECRET="test-client-id", SASAPAY_MERCHANT_CODE="600980")
+    def test_signed_sasapay_callback_marks_matching_order_paid(self):
+        from .models import Order
+
+        order = Order.objects.create(customer_email="buyer@example.com", total="12.50",
+                                     checkout_request_id="checkout-123", merchant_request_id="ORDER-1")
+        payload = {
+            "TransactionCode": "TX-1", "MerchantCode": "600980", "CustomerMobile": "254700000000",
+            "MerchantRequestID": "ORDER-1", "CheckoutRequestID": "checkout-123",
+            "ResultCode": "0", "TransAmount": "12.50",
+        }
+        message = "TX-1-600980-254700000000-ORDER-1-12.50"
+        signature = hmac.new(b"test-client-id", message.encode(), hashlib.sha512).hexdigest()
+        response = self.client.post("/webhooks/sasapay/", payload, content_type="application/json",
+                                    HTTP_X_SASAPAY_SIGNATURE=signature)
+        self.assertEqual(response.status_code, 200)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.Status.PAID)

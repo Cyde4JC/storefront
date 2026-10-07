@@ -1,17 +1,33 @@
 # Storefront
 
-A Django storefront with admin-managed products, a session cart, Stripe Checkout, and a Django REST Framework API.
+A Django storefront with admin-managed products priced in Kenyan shillings (KES), a session cart, SasaPay-hosted checkout and a Django REST Framework API.
 
 ## Local setup
 
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate
+# Git Bash on Windows: source .venv/Scripts/activate
 # macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-Copy `.env.example` to `.env`, then set a unique `DJANGO_SECRET_KEY` and Stripe **test-mode** keys from your Stripe Dashboard. Do not commit `.env`; it is excluded by `.gitignore`. No Stripe account or credentials are created by this project. Create/verify your developer account yourself at https://dashboard.stripe.com/ and use keys prefixed with `pk_test_` and `sk_test_` for testing.
+Set a unique `DJANGO_SECRET_KEY` in `.env`. Do not commit `.env`; it is excluded by `.gitignore`.
+
+## SasaPay sandbox setup
+
+1. Register a merchant account at https://merchants.sasapay.app/auth/register and complete any onboarding required to obtain/use a merchant code.
+2. Register at https://developer.sasapay.app/ and create a **Sandbox Application**. Set its callback URL to your publicly reachable URL ending in `/webhooks/sasapay/`.
+3. Copy the sandbox Client ID and Client Secret into `SASAPAY_CLIENT_ID` and `SASAPAY_CLIENT_SECRET` in local `.env`. Add the sandbox merchant code to `SASAPAY_MERCHANT_CODE`. Keep all credentials private.
+4. SasaPay must reach the callback over HTTPS. For local development, run a tunnel such as Cloudflare Tunnel or ngrok to port 8000, configure the resulting HTTPS URL plus `/webhooks/sasapay/` in both the SasaPay app and `SASAPAY_CALLBACK_URL`.
+5. Start Django and test checkout from the site. SasaPay sandbox checkout offers payment choices according to the sandbox application, including M-Pesa, Airtel Money, SasaPay wallet and card as enabled by its API.
+
+The project requests an OAuth token from the sandbox, creates a KES hosted checkout, redirects the customer, and validates the SasaPay `X-SasaPay-Signature` HMAC-SHA512 callback before marking a matching order paid. The signing key defaults to the app Client ID as described in SasaPay's callback-security documentation; override `SASAPAY_CALLBACK_SECRET` only if the provider gives a different value. Callback amount, merchant and order references are checked. The return/redirect page is not treated as proof of payment; the callback updates status.
+
+For production, get SasaPay approval and production app credentials, use the provider's production base URL and HTTPS domain, and follow the provider's merchant onboarding and callback security guidance. Do not use production credentials for testing.
+
+## Run Django
 
 ```bash
 python manage.py migrate
@@ -19,9 +35,7 @@ python manage.py createsuperuser
 python manage.py runserver
 ```
 
-Visit `/admin/` to add products (name, price, stock, optional description and image URL). The shop is at `/`. Checkout posts to Stripe-hosted Checkout; without test credentials, it shows a configuration message and does not create a payment. Stripe redirect success is verified against Stripe, and `/webhooks/stripe/` verifies signed `checkout.session.completed` and `checkout.session.expired` events. During local testing, install the Stripe CLI and run `stripe listen --forward-to localhost:8000/webhooks/stripe/`; put the CLI-provided `whsec_...` value in `STRIPE_WEBHOOK_SECRET`. In the Stripe Dashboard, configure the same endpoint for deployed environments.
-
-Use Stripe's test card `4242 4242 4242 4242`, any future expiry, and any CVC when testing Stripe Checkout. Test-mode transactions do not charge a real card.
+Visit `/admin/` to add products (price in KES); the shop is at `/`.
 
 ## REST API
 
@@ -33,8 +47,11 @@ Use Stripe's test card `4242 4242 4242 4242`, any future expiry, and any CVC whe
 
 The API is paginated. Product writes require an authenticated staff user; read access is public.
 
-## Environment settings
+Before deployment, set `DJANGO_DEBUG=false`, a strong secret, and explicit allowed hosts; serve HTTPS.
 
-`DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `STOREFRONT_CURRENCY` are read from the process environment or `.env`.
+## Official SasaPay documentation
 
-Before deployment, set `DJANGO_DEBUG=false`, a strong secret, and explicit allowed hosts; serve HTTPS and configure Stripe webhooks.
+- [Getting started](https://developer.sasapay.app/docs/getting-started)
+- [Authentication](https://developer.sasapay.app/docs/apis/authentication)
+- [Checkout payments](https://developer.sasapay.app/docs/checkout-payments)
+- [Callback security](https://developer.sasapay.app/docs/apis/callback-security)

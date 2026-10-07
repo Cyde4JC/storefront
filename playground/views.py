@@ -1,12 +1,17 @@
+import hashlib
+import hmac
+import json
 from decimal import Decimal
 
+import requests
 from django.conf import settings
 from django.contrib import messages
+from django.db import transaction
 from django.http import HttpResponse, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
-from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 from rest_framework import permissions, viewsets
 
 from .models import Order, OrderItem, Product
@@ -57,6 +62,61 @@ def add_to_cart(request, product_id):
     return redirect("shop:product_list")
 
 
+def _sasapay_ready():
+    return all((settings.SASAPAY_CLIENT_ID, settings.SASAPAY_CLIENT_SECRET, settings.SASAPAY_MERCHANT_CODE,
+                settings.SASAPAY_CALLBACK_URL))
+
+
+def _sasapay_checkout_url():
+    return settings.SASAPAY_API_BASE.rstrip("/") + "/api/v1/payments/card-payments/"
+
+
+def _start_sasapay_checkout(order, rows, email, request):
+    base = settings.SASAPAY_API_BASE.rstrip("/")
+    token_response = requests.get(
+        f"{base}/api/v1/auth/token/",
+        params={"grant_type": "client_credentials"},
+        auth=(settings.SASAPAY_CLIENT_ID, settings.SASAPAY_CLIENT_SECRET),
+        timeout=20,
+    )
+    token_response.raise_for_status()
+    token = token_response.json().get("access_token")
+    if not token:
+        raise ValueError("SasaPay did not return an access token")
+
+    payload = {
+        "MerchantCode": settings.SASAPAY_MERCHANT_CODE,
+        "Amount": f"{order.total:.2f}",
+        "Reference": f"ORDER-{order.pk}",
+        "Description": f"Storefront order {order.pk}",
+        "Currency": "KES",
+        "PayerEmail": email,
+        "CallbackUrl": settings.SASAPAY_CALLBACK_URL,
+        "RedirectUrl": request.build_absolute_uri(reverse("shop:checkout_success")) + f"?order_id={order.pk}",
+        "SuccessUrl": request.build_absolute_uri(reverse("shop:checkout_success")) + f"?order_id={order.pk}",
+        "FailureUrl": request.build_absolute_uri(reverse("shop:checkout_cancel")) + f"?order_id={order.pk}",
+        "RedirectEnabled": True,
+        "SasaPayWalletEnabled": True,
+        "MpesaEnabled": True,
+        "AirtelEnabled": True,
+        "CardEnabled": True,
+    }
+    response = requests.post(
+        _sasapay_checkout_url(), json=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    result = response.json()
+    checkout_url = result.get("CheckoutUrl")
+    if result.get("status") is not True or not checkout_url:
+        raise ValueError(result.get("ResponseDescription") or result.get("detail") or "SasaPay did not return a checkout URL")
+    order.checkout_request_id = result.get("CheckoutRequestID") or None
+    order.merchant_request_id = str(result.get("MerchantRequestID") or f"ORDER-{order.pk}")
+    order.save(update_fields=["checkout_request_id", "merchant_request_id"])
+    return checkout_url
+
+
 def checkout(request):
     cart = _cart(request)
     products = Product.objects.filter(pk__in=cart.keys(), is_active=True)
@@ -73,8 +133,8 @@ def checkout(request):
         if not email or not rows:
             messages.error(request, "Enter a valid email and add at least one available product.")
             return render(request, "playground/checkout.html", {"rows": rows, "total": total})
-        if not settings.STRIPE_SECRET_KEY:
-            messages.error(request, "Checkout is not configured yet. Set STRIPE_SECRET_KEY to a Stripe test key.")
+        if not _sasapay_ready():
+            messages.error(request, "SasaPay sandbox is not configured. Add its developer credentials and callback URL to your local .env file.")
             return render(request, "playground/checkout.html", {"rows": rows, "total": total})
         order = Order.objects.create(customer_email=email, total=total)
         for row in rows:
@@ -82,46 +142,24 @@ def checkout(request):
             OrderItem.objects.create(order=order, product=product, product_name=product.name,
                                      unit_price=product.price, quantity=row["quantity"])
         try:
-            import stripe
-            stripe.api_key = settings.STRIPE_SECRET_KEY
-            session = stripe.checkout.Session.create(
-                mode="payment", customer_email=email,
-                line_items=[{
-                    "price_data": {"currency": settings.STOREFRONT_CURRENCY,
-                                   "product_data": {"name": row["product"].name},
-                                   "unit_amount": int(row["product"].price * 100)},
-                    "quantity": row["quantity"],
-                } for row in rows],
-                metadata={"order_id": str(order.pk)},
-                success_url=request.build_absolute_uri(reverse("shop:checkout_success")) + "?session_id={CHECKOUT_SESSION_ID}",
-                cancel_url=request.build_absolute_uri(reverse("shop:checkout_cancel")),
-            )
-            order.stripe_session_id = session.id
-            order.save(update_fields=["stripe_session_id"])
-            return redirect(session.url)
-        except Exception:
+            return redirect(_start_sasapay_checkout(order, rows, email, request))
+        except (requests.RequestException, ValueError, KeyError) as exc:
             order.status = Order.Status.FAILED
             order.save(update_fields=["status"])
-            messages.error(request, "Could not start Stripe Checkout. Verify your Stripe test credentials and try again.")
+            if settings.DEBUG:
+                messages.error(request, f"Could not start SasaPay checkout: {exc}")
+            else:
+                messages.error(request, "Could not start SasaPay checkout. Verify your sandbox settings and try again.")
     return render(request, "playground/checkout.html", {"rows": rows, "total": total})
 
 
 def checkout_success(request):
-    session_id = request.GET.get("session_id")
-    if session_id and settings.STRIPE_SECRET_KEY:
-        try:
-            import stripe
-            stripe.api_key = settings.STRIPE_SECRET_KEY
-            stripe_session = stripe.checkout.Session.retrieve(session_id)
-            order = Order.objects.get(pk=stripe_session.metadata["order_id"], stripe_session_id=session_id)
-            if stripe_session.payment_status == "paid":
-                order.status = Order.Status.PAID
-                order.save(update_fields=["status"])
-                request.session["cart"] = {}
-        except Exception:
-            return HttpResponseBadRequest("Unable to verify checkout session.")
-    else:
-        order = None
+    order = None
+    order_id = request.GET.get("order_id")
+    if order_id:
+        order = Order.objects.filter(pk=order_id).first()
+        if order and order.status == Order.Status.PAID:
+            request.session["cart"] = {}
     return render(request, "playground/checkout_success.html", {"order": order})
 
 
@@ -131,25 +169,48 @@ def checkout_cancel(request):
 
 @csrf_exempt
 @require_POST
-def stripe_webhook(request):
-    if not settings.STRIPE_WEBHOOK_SECRET:
-        return HttpResponse("Webhook is not configured", status=503)
+def sasapay_callback(request):
+    """Validate SasaPay's HMAC-SHA512 callback before changing order status."""
+    if not settings.SASAPAY_CALLBACK_SECRET:
+        return HttpResponse("SasaPay callback verification is not configured", status=503)
     try:
-        import stripe
-        event = stripe.Webhook.construct_event(
-            request.body,
-            request.headers.get("Stripe-Signature", ""),
-            settings.STRIPE_WEBHOOK_SECRET,
-        )
-    except (ValueError, Exception):
-        return HttpResponseBadRequest("Invalid webhook signature or payload")
-    if event.type == "checkout.session.completed":
-        session = event.data.object
-        if session.payment_status == "paid":
-            Order.objects.filter(pk=session.metadata.get("order_id"), stripe_session_id=session.id,
-                                 status=Order.Status.PENDING).update(status=Order.Status.PAID)
-    elif event.type == "checkout.session.expired":
-        session = event.data.object
-        Order.objects.filter(pk=session.metadata.get("order_id"), stripe_session_id=session.id,
-                             status=Order.Status.PENDING).update(status=Order.Status.FAILED)
+        payload = json.loads(request.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return HttpResponseBadRequest("Invalid JSON callback")
+
+    signature = request.headers.get("X-SasaPay-Signature", "")
+    signature_values = (
+        payload.get("TransactionCode") or payload.get("TransID") or "",
+        payload.get("MerchantCode") or "",
+        payload.get("CustomerMobile") or payload.get("AccountNumber") or "",
+        payload.get("MerchantRequestID") or payload.get("MerchantReference") or "",
+        payload.get("TransAmount") or payload.get("RequestedAmount") or "",
+    )
+    message = "-".join(str(value) for value in signature_values)
+    expected = hmac.new(settings.SASAPAY_CALLBACK_SECRET.encode(), message.encode(), hashlib.sha512).hexdigest()
+    if not signature or not hmac.compare_digest(expected, signature):
+        return HttpResponse("Invalid SasaPay callback signature", status=401)
+    if str(payload.get("MerchantCode", "")) != settings.SASAPAY_MERCHANT_CODE:
+        return HttpResponse("Merchant code mismatch", status=400)
+
+    merchant_reference = str(payload.get("MerchantRequestID") or payload.get("MerchantReference") or "")
+    checkout_id = str(payload.get("CheckoutRequestID") or payload.get("CheckoutId") or "")
+    result_code = str(payload.get("ResultCode", ""))
+    success = result_code == "0" and (payload.get("Paid") is not False)
+    try:
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(merchant_request_id=merchant_reference)
+            if order.checkout_request_id and checkout_id and order.checkout_request_id != checkout_id:
+                return HttpResponse("Checkout ID mismatch", status=400)
+            amount = Decimal(str(payload.get("TransAmount") or payload.get("PaidAmount") or payload.get("RequestedAmount") or "0"))
+            if success and amount == order.total and order.status == Order.Status.PENDING:
+                order.status = Order.Status.PAID
+                order.save(update_fields=["status"])
+            elif not success and order.status == Order.Status.PENDING:
+                order.status = Order.Status.FAILED
+                order.save(update_fields=["status"])
+    except Order.DoesNotExist:
+        return HttpResponse("Unknown order reference", status=404)
+    except (ValueError, TypeError):
+        return HttpResponseBadRequest("Invalid amount in callback")
     return HttpResponse(status=200)

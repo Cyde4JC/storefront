@@ -8,7 +8,7 @@ class Product(models.Model):
     name = models.CharField(max_length=200)
     slug = models.SlugField(max_length=220, unique=True, blank=True)
     description = models.TextField(blank=True)
-    price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
+    price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)], help_text="Price in Kenyan shillings (KES).")
     image_url = models.URLField(blank=True)
     stock = models.PositiveIntegerField(default=0)
     is_active = models.BooleanField(default=True)
@@ -41,7 +41,8 @@ class Order(models.Model):
     customer_email = models.EmailField()
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING)
     total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    stripe_session_id = models.CharField(max_length=255, blank=True, unique=True, null=True)
+    checkout_request_id = models.CharField(max_length=255, blank=True, unique=True, null=True)
+    merchant_request_id = models.CharField(max_length=255, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

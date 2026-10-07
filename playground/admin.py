@@ -20,6 +20,6 @@ class OrderItemInline(admin.TabularInline):
 class OrderAdmin(admin.ModelAdmin):
     list_display = ("id", "customer_email", "status", "total", "created_at")
     list_filter = ("status", "created_at")
-    search_fields = ("customer_email", "stripe_session_id")
-    readonly_fields = ("stripe_session_id", "created_at")
+    search_fields = ("customer_email", "checkout_request_id", "merchant_request_id")
+    readonly_fields = ("checkout_request_id", "merchant_request_id", "created_at")
     inlines = (OrderItemInline,)
